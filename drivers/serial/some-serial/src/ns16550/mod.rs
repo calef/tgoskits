@@ -9,9 +9,9 @@ mod registers;
 
 use bitflags::Flags;
 use rdif_serial::{
-    Config, ConfigError, DataBits, IRQ_RX_BATCH_CAPACITY, IrqRxBatch, Parity, RxErrorFlags, RxFlag,
-    RxSample, SerialEventSet, SerialIrqEvent, SerialIrqReport, SerialParts, SplitUart, StopBits,
-    UartEmergencyTx, UartInfo, UartIrq, UartPort,
+    Config, ConfigError, DataBits, Framing, IRQ_RX_BATCH_CAPACITY, IrqRxBatch, Parity,
+    RxErrorFlags, RxFlag, RxSample, SerialEventSet, SerialIrqEvent, SerialIrqReport, SerialParts,
+    SplitUart, StopBits, UartEmergencyTx, UartInfo, UartIrq, UartPort,
 };
 use registers::*;
 
@@ -48,7 +48,7 @@ pub trait Kind: Clone + Send + Sync + 'static {
             return Err(ConfigError::InvalidBaudrate);
         }
 
-        let divisor = clock_freq / (16 * baudrate);
+        let divisor = u64::from(clock_freq) / (16 * u64::from(baudrate));
         if divisor == 0 || divisor > 0xFFFF {
             return Err(ConfigError::InvalidBaudrate);
         }
@@ -265,7 +265,33 @@ impl<T: Kind> UartIrq for Ns16550Irq<T> {
 }
 
 impl<T: Kind> UartPort for Ns16550<T> {
+    fn framing(&self) -> Option<Framing> {
+        let lcr: LineControlFlags = self.read_flags(UART_LCR);
+        let data_bits = match lcr & LineControlFlags::WORD_LENGTH_MASK {
+            LineControlFlags::WORD_LENGTH_5 => DataBits::Five,
+            LineControlFlags::WORD_LENGTH_6 => DataBits::Six,
+            LineControlFlags::WORD_LENGTH_7 => DataBits::Seven,
+            _ => DataBits::Eight,
+        };
+        let stop_bits = if lcr.contains(LineControlFlags::STOP_BITS) {
+            StopBits::Two
+        } else {
+            StopBits::One
+        };
+        let parity = crate::line_parity(
+            lcr.contains(LineControlFlags::PARITY_ENABLE),
+            lcr.contains(LineControlFlags::EVEN_PARITY),
+            lcr.contains(LineControlFlags::STICK_PARITY),
+        );
+        Some(Framing {
+            data_bits,
+            stop_bits,
+            parity,
+        })
+    }
+
     fn startup(&mut self, config: &Config) -> Result<(), ConfigError> {
+        self.validate_baudrate_request(config.baudrate)?;
         let original_ier: InterruptEnableFlags = self.read_flags(UART_IER);
         self.write_flags(UART_IER, InterruptEnableFlags::empty());
         if let Err(error) = self.set_config(config) {
@@ -278,11 +304,10 @@ impl<T: Kind> UartPort for Ns16550<T> {
         self.enable_fifo(true);
 
         let mut mcr: ModemControlFlags = self.read_flags(UART_MCR);
-        mcr.insert(
-            ModemControlFlags::DATA_TERMINAL_READY
-                | ModemControlFlags::REQUEST_TO_SEND
-                | ModemControlFlags::OUT_2,
-        );
+        if config.modem_outputs.is_none() {
+            mcr.insert(ModemControlFlags::DATA_TERMINAL_READY | ModemControlFlags::REQUEST_TO_SEND);
+        }
+        mcr.insert(ModemControlFlags::OUT_2);
         self.write_flags(UART_MCR, mcr);
         self.saved_lsr = LineStatusFlags::empty();
         Ok(())
@@ -293,9 +318,9 @@ impl<T: Kind> UartPort for Ns16550<T> {
     }
 
     fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
-        // 配置波特率
+        self.validate_baudrate_request(config.baudrate)?;
         if let Some(baudrate) = config.baudrate {
-            self.set_baudrate_internal(baudrate)?;
+            self.base.set_baudrate(self.clock_freq, baudrate)?;
         }
 
         // 配置数据位
@@ -311,6 +336,13 @@ impl<T: Kind> UartPort for Ns16550<T> {
         // 配置奇偶校验
         if let Some(parity) = config.parity {
             self.set_parity_internal(parity)?;
+        }
+
+        if let Some(outputs) = config.modem_outputs {
+            let mut mcr: ModemControlFlags = self.read_flags(UART_MCR);
+            mcr.set(ModemControlFlags::DATA_TERMINAL_READY, outputs.dtr);
+            mcr.set(ModemControlFlags::REQUEST_TO_SEND, outputs.rts);
+            self.write_flags(UART_MCR, mcr);
         }
         Ok(())
     }
@@ -408,7 +440,11 @@ impl<T: Kind> SplitUart for Ns16550<T> {
         UartInfo {
             name: "NS16550 UART",
             register_base: self.base.get_base(),
-            initial_baudrate: self.base.baudrate(self.clock_freq),
+            initial_baudrate: if self.clock_freq == 0 {
+                0
+            } else {
+                self.base.baudrate(self.clock_freq)
+            },
         }
     }
 
@@ -603,9 +639,12 @@ impl<T: Kind> Ns16550<T> {
         fifo.contains(InterruptIdentificationFlags::FIFO_ENABLE_MASK)
     }
 
-    /// 设置波特率
-    fn set_baudrate_internal(&mut self, baudrate: u32) -> Result<(), ConfigError> {
-        self.base.set_baudrate(self.clock_freq, baudrate)
+    fn validate_baudrate_request(&self, baudrate: Option<u32>) -> Result<(), ConfigError> {
+        match baudrate {
+            Some(0) => Err(ConfigError::InvalidBaudrate),
+            Some(_) if self.clock_freq == 0 => Err(ConfigError::BaudrateUnavailable),
+            _ => Ok(()),
+        }
     }
 
     /// 设置数据位
@@ -1171,6 +1210,50 @@ mod tests {
     }
 
     #[test]
+    fn modem_outputs_preserve_the_divisor_and_irq_gate() {
+        use rdif_serial::ModemOutputs;
+
+        let (_guard, mut uart) = serial();
+        uart.clock_freq = 0;
+        uart.startup(&Config::new()).unwrap();
+        DLL_REG.store(37, Ordering::SeqCst);
+        DLH_REG.store(2, Ordering::SeqCst);
+        let gate = ModemControlFlags::OUT_2;
+        let raised =
+            gate | ModemControlFlags::DATA_TERMINAL_READY | ModemControlFlags::REQUEST_TO_SEND;
+        let mut config = Config {
+            modem_outputs: Some(ModemOutputs {
+                dtr: false,
+                rts: false,
+            }),
+            ..Config::new()
+        };
+
+        uart.set_config(&config).unwrap();
+        assert_eq!(REGS[UART_MCR as usize].load(Ordering::SeqCst), gate.bits());
+
+        config.modem_outputs = Some(ModemOutputs {
+            dtr: true,
+            rts: true,
+        });
+        config.baudrate = Some(57_600);
+        assert_eq!(
+            uart.set_config(&config),
+            Err(ConfigError::BaudrateUnavailable)
+        );
+        assert_eq!(REGS[UART_MCR as usize].load(Ordering::SeqCst), gate.bits());
+
+        config.baudrate = None;
+        uart.set_config(&config).unwrap();
+        assert_eq!(
+            REGS[UART_MCR as usize].load(Ordering::SeqCst),
+            raised.bits()
+        );
+        assert_eq!(DLL_REG.load(Ordering::SeqCst), 37);
+        assert_eq!(DLH_REG.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn startup_enables_fifo_before_checking_fifo_status() {
         let (_guard, mut uart) = serial();
 
@@ -1189,10 +1272,39 @@ mod tests {
         let early_mask = UART_IER_RDI | UART_IER_RLSI;
         REGS[UART_IER as usize].store(early_mask, Ordering::SeqCst);
 
-        let result = uart.startup(&Config::new().baudrate(0));
+        let result = uart.startup(&Config::new().baudrate(230_400));
 
         assert_eq!(result, Err(ConfigError::InvalidBaudrate));
         assert_eq!(REGS[UART_IER as usize].load(Ordering::SeqCst), early_mask);
+
+        uart.clock_freq = 0;
+        DLL_REG.store(37, Ordering::SeqCst);
+        DLH_REG.store(2, Ordering::SeqCst);
+        let original_framing = LineControlFlags::WORD_LENGTH_7
+            | LineControlFlags::PARITY_ENABLE
+            | LineControlFlags::EVEN_PARITY;
+        REGS[UART_LCR as usize].store(original_framing.bits(), Ordering::SeqCst);
+        let requested_config = Config::new().baudrate(115_200).data_bits(DataBits::Eight);
+        let expected_error = Err(ConfigError::BaudrateUnavailable);
+        assert_eq!(uart.startup(&requested_config), expected_error);
+        assert_eq!(REGS[UART_IER as usize].load(Ordering::SeqCst), early_mask);
+
+        uart.startup(&Config::new()).unwrap();
+        assert_eq!(uart.set_config(&requested_config), expected_error);
+        assert_eq!(
+            uart.framing(),
+            Some(Framing {
+                data_bits: DataBits::Seven,
+                stop_bits: StopBits::One,
+                parity: Parity::Even,
+            })
+        );
+        assert_eq!(
+            REGS[UART_LCR as usize].load(Ordering::SeqCst),
+            original_framing.bits()
+        );
+        assert_eq!(DLL_REG.load(Ordering::SeqCst), 37);
+        assert_eq!(DLH_REG.load(Ordering::SeqCst), 2);
     }
 
     #[test]

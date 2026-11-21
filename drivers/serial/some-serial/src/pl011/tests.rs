@@ -265,6 +265,12 @@ fn set_config_waits_for_enabled_tx_drain_before_disabling_uart() {
     let (mut regs, mut uart) = pl011_with_registers();
     regs.uartcr
         .write(UARTCR::UARTEN::SET + UARTCR::TXE::SET + UARTCR::RXE::SET);
+    let lcr = UARTLCR_H::WLEN::SixBit
+        + UARTLCR_H::STP2::SET
+        + UARTLCR_H::PEN::SET
+        + UARTLCR_H::EPS::SET
+        + UARTLCR_H::SPS::SET;
+    regs.uartlcr_h.write(lcr);
     write_test_reg(
         &mut regs,
         0x018,
@@ -290,6 +296,16 @@ fn set_config_waits_for_enabled_tx_drain_before_disabling_uart() {
     assert!(cr.is_set(UARTCR::UARTEN));
     assert!(cr.is_set(UARTCR::TXE));
     assert!(cr.is_set(UARTCR::RXE));
+    let line_control = regs.uartlcr_h.get();
+    assert_eq!(
+        uart.framing(),
+        Some(Framing {
+            data_bits: DataBits::Six,
+            stop_bits: StopBits::Two,
+            parity: Parity::Space,
+        })
+    );
+    assert_eq!(regs.uartlcr_h.get(), line_control);
 }
 
 #[test]
@@ -312,10 +328,43 @@ fn invalid_config_restores_every_configuration_register() {
     write_test_reg(&mut regs, 0x018, 0);
     let before = config_register_snapshot(&regs);
 
-    let result = uart.set_config(&Config::new().baudrate(2_000_000));
+    let mut config = Config {
+        modem_outputs: Some(rdif_serial::ModemOutputs {
+            dtr: true,
+            rts: true,
+        }),
+        ..Config::new().baudrate(2_000_000)
+    };
+    let result = uart.set_config(&config);
 
     assert_eq!(result, Err(ConfigError::InvalidBaudrate));
     assert_eq!(config_register_snapshot(&regs), before);
+
+    config.baudrate = None;
+    config.modem_outputs = Some(rdif_serial::ModemOutputs {
+        dtr: false,
+        rts: false,
+    });
+    regs.uartcr
+        .modify(UARTCR::DTR::SET + UARTCR::RTS::SET + UARTCR::RTSEN::SET);
+    let cr = regs.uartcr.get();
+    let lcr = regs.uartlcr_h.get();
+    write_test_reg(&mut regs, 0x018, UARTFR::BUSY::SET.value);
+    uart.set_config(&config).unwrap();
+    assert_eq!(
+        regs.uartcr.get(),
+        cr & !(UARTCR::DTR::SET + UARTCR::RTS::SET + UARTCR::RTSEN::SET).value
+    );
+    assert_eq!(regs.uartlcr_h.get(), lcr);
+
+    // Repeated deassertion must retain the original flow-control policy.
+    uart.set_config(&config).unwrap();
+    config.modem_outputs = Some(rdif_serial::ModemOutputs {
+        dtr: true,
+        rts: true,
+    });
+    uart.set_config(&config).unwrap();
+    assert_eq!(regs.uartcr.get(), cr);
 }
 
 #[test]

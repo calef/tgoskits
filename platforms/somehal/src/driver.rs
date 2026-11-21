@@ -21,6 +21,10 @@ pub fn rdrive_setup() {
                 "failed to initialize rdrive with ACPI RSDP {:#x}: {:?}",
                 rsdp, err
             );
+        } else if let Some(address) =
+            crate::boot_console::explicit_acpi_serial_address(someboot::cmdline())
+        {
+            let _ = rdrive::probe::acpi::with_acpi(|system| system.prefer_serial_console(address));
         }
     } else {
         warn!("No FDT or ACPI RSDP found; skip rdrive initialization");

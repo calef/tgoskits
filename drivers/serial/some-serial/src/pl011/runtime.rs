@@ -41,6 +41,31 @@ impl Pl011ConfigSnapshot {
 }
 
 impl UartPort for Pl011 {
+    fn framing(&self) -> Option<Framing> {
+        let lcr = self.registers().uartlcr_h.extract();
+        let data_bits = match lcr.read_as_enum(UARTLCR_H::WLEN) {
+            Some(UARTLCR_H::WLEN::Value::FiveBit) => DataBits::Five,
+            Some(UARTLCR_H::WLEN::Value::SixBit) => DataBits::Six,
+            Some(UARTLCR_H::WLEN::Value::SevenBit) => DataBits::Seven,
+            _ => DataBits::Eight,
+        };
+        let stop_bits = if lcr.is_set(UARTLCR_H::STP2) {
+            StopBits::Two
+        } else {
+            StopBits::One
+        };
+        let parity = crate::line_parity(
+            lcr.is_set(UARTLCR_H::PEN),
+            lcr.is_set(UARTLCR_H::EPS),
+            lcr.is_set(UARTLCR_H::SPS),
+        );
+        Some(Framing {
+            data_bits,
+            stop_bits,
+            parity,
+        })
+    }
+
     fn startup(&mut self, config: &Config) -> Result<(), ConfigError> {
         let snapshot = Pl011ConfigSnapshot::capture(self.registers());
         // `open` performs its fallible drain before touching any register, so a
@@ -150,6 +175,16 @@ impl Pl011 {
         config: &Config,
         wait_step: impl FnMut(),
     ) -> Result<(), ConfigError> {
+        if let Some(outputs) = config.modem_outputs
+            && config.baudrate.is_none()
+            && config.data_bits.is_none()
+            && config.stop_bits.is_none()
+            && config.parity.is_none()
+        {
+            self.set_modem_outputs(outputs);
+            return Ok(());
+        }
+
         // Let the enabled UART advance the original FIFO before changing any
         // configuration register. A timeout here has no state to roll back.
         self.wait_until_not_busy_with(wait_step)?;
@@ -178,6 +213,9 @@ impl Pl011 {
             }
             self.registers().uartlcr_h.modify(UARTLCR_H::FEN::SET);
             self.registers().uartcr.set(snapshot.cr);
+            if let Some(outputs) = config.modem_outputs {
+                self.set_modem_outputs(outputs);
+            }
             Ok(())
         })();
 
@@ -185,6 +223,18 @@ impl Pl011 {
             snapshot.restore(self.registers());
         }
         result
+    }
+
+    fn set_modem_outputs(&mut self, outputs: rdif_serial::ModemOutputs) {
+        // Deassertion temporarily overrides automatic RTS. Restore the
+        // previous flow-control mode when RTS is asserted again.
+        let auto_rts = self.restore_auto_rts || self.registers().uartcr.is_set(UARTCR::RTSEN);
+        self.restore_auto_rts = auto_rts && !outputs.rts;
+        self.registers().uartcr.modify(
+            UARTCR::DTR.val(u32::from(outputs.dtr))
+                + UARTCR::RTS.val(u32::from(outputs.rts))
+                + UARTCR::RTSEN.val(u32::from(auto_rts && outputs.rts)),
+        );
     }
 }
 
